@@ -45,23 +45,23 @@ doctor: ## Show uv, Python, Camoufox and active browser state
 
 .PHONY: lint
 lint: ## Lint Python with ruff
-	@$(PY) ruff check src tests examples
+	@$(PY) ruff check src tests examples scripts
 
 .PHONY: lint-fix
 lint-fix: ## Lint and apply safe fixes
-	@$(PY) ruff check src tests examples --fix
+	@$(PY) ruff check src tests examples scripts --fix
 
 .PHONY: format
 format: ## Format Python with ruff
-	@$(PY) ruff format src tests examples
+	@$(PY) ruff format src tests examples scripts
 
 .PHONY: format-check
 format-check: ## Verify formatting without writing
-	@$(PY) ruff format --check src tests examples
+	@$(PY) ruff format --check src tests examples scripts
 
 .PHONY: syntax
 syntax: ## Byte-compile every Python entry point
-	@$(PY) python -m compileall -q src examples tests
+	@$(PY) python -m compileall -q src examples tests scripts
 	@echo "syntax ok"
 
 .PHONY: check
@@ -97,6 +97,10 @@ start-headless: ## Start the server without a window
 start-virtual: ## Start a headed browser on a private Xvfb display (Linux)
 	@$(PY) pi-camoufox --http-port $(HTTP_PORT) --host $(HOST) \
 		--profile "$(PROFILE)" --virtual-display --settle-ms $(SETTLE_MS)
+
+.PHONY: warm
+warm: ## Visit common sites to warm the persistent profile (cookies/history)
+	@$(PY) python scripts/warm_profile.py http://127.0.0.1:$(HTTP_PORT)
 
 .PHONY: demo
 demo: ## Run the example agent loop against a running server

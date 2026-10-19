@@ -70,6 +70,7 @@ class ServerOptions:
     coalesce_ms: int = DEFAULT_COALESCE_MS
     artifact_ttl_s: int = DEFAULT_ARTIFACT_TTL_S
     debug: bool = False
+    fail_fast: bool = False
 
     def camoufox_kwargs(self, fingerprint: dict[str, Any] | None) -> dict[str, Any]:
         """Keyword arguments for :class:`camoufox.AsyncCamoufox`.

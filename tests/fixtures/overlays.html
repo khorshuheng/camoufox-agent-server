@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Fixture: Overlays</title></head>
+  <body>
+    <button id="real" onclick="document.title = 'Real clicked'">Real action</button>
+
+    <div class="cookie-banner" id="cookie">
+      <p>We use cookies.</p>
+      <button id="accept" onclick="document.title = 'Accepted'; this.parentElement.remove()">Accept all</button>
+      <button id="cookie-close" aria-label="Close" onclick="this.parentElement.remove()">×</button>
+    </div>
+
+    <div role="dialog" id="signin">
+      <p>Sign in, save money</p>
+      <button aria-label="Close" onclick="this.parentElement.remove()">×</button>
+      <button>Sign in</button>
+    </div>
+  </body>
+</html>

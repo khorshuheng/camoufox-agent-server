@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Fixture: Shadow</title></head>
+  <body>
+    <div id="host"></div>
+    <script>
+      const root = document.querySelector('#host').attachShadow({ mode: 'open' });
+      root.innerHTML = '<button id="shadow-btn">Shadow action</button>';
+      root.querySelector('#shadow-btn').addEventListener('click', () => {
+        document.title = 'Shadow clicked';
+      });
+    </script>
+  </body>
+</html>

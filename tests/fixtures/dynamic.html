@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Fixture: Dynamic</title></head>
+  <body>
+    <div id="status">loading</div>
+    <script>
+      setTimeout(() => {
+        document.querySelector('#status').textContent = 'ready';
+        const first = document.createElement('div');
+        first.className = 'item';
+        first.textContent = 'one';
+        const second = document.createElement('div');
+        second.className = 'item';
+        second.textContent = 'two';
+        document.body.append(first, second);
+        history.pushState({}, '', '#ready');
+      }, 300);
+    </script>
+  </body>
+</html>

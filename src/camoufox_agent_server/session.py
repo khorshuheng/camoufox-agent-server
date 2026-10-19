@@ -21,6 +21,7 @@ from playwright.async_api import (
     Error as PlaywrightError,
 )
 
+from .challenge import detect_challenge
 from .events import EventBus
 from .observe import SCROLL_POSITION_JS, SNAPSHOT_JS
 
@@ -49,6 +50,7 @@ class Tab:
         self.collect_console = collect_console
         self.main_world_eval = main_world_eval
         self.requests: dict[Request, dict[str, Any]] = {}
+        self.navigation_id = 0
         self.attached = False
         self.lock = asyncio.Lock()
         self._dialog: Dialog | None = None
@@ -78,7 +80,11 @@ class Tab:
         return self
 
     def _emit(self, event_type: str, data: dict[str, Any], **kwargs: Any) -> None:
-        self.events.emit(event_type, {"tabId": self.id, **data}, **kwargs)
+        self.events.emit(
+            event_type,
+            {"tabId": self.id, "navigationId": self.navigation_id, **data},
+            **kwargs,
+        )
 
     # -- event handlers ----------------------------------------------------
 
@@ -87,12 +93,16 @@ class Tab:
             return
         text = message.text[:2000]
         location = message.location or {}
+        url = location.get("url")
+        if _is_extension_url(url):
+            return
         self._emit(
             "console",
             {
                 "level": message.type,
                 "text": text,
-                "url": location.get("url"),
+                "url": url,
+                "documentUrl": self.url,
             },
             key=f"console:{message.type}:{text}",
             summary=text[:140],
@@ -101,20 +111,30 @@ class Tab:
     def _on_page_error(self, error: PlaywrightError) -> None:
         if not self.collect_console:
             return
+        message = str(error)
+        if _is_extension_url(message):
+            return
         self._emit(
             "pageerror",
-            {"message": str(error), "stack": getattr(error, "stack", None)},
-            key=f"pageerror:{str(error)[:180]}",
+            {
+                "message": message,
+                "stack": getattr(error, "stack", None),
+                "documentUrl": self.url,
+            },
+            key=f"pageerror:{message[:180]}",
         )
 
     def _on_request(self, request: Request) -> None:
-        if not self.collect_network:
+        if not self.collect_network or _is_extension_url(request.url):
             return
+        document_url = _request_document_url(request, self.url)
         self.requests[request] = {
             "method": request.method,
             "url": request.url,
             "resourceType": request.resource_type,
             "ts": time.time(),
+            "navigationId": self.navigation_id,
+            "documentUrl": document_url,
         }
         self._emit(
             "request",
@@ -123,15 +143,20 @@ class Tab:
                 "url": request.url,
                 "resourceType": request.resource_type,
                 "frame": bool(request.frame != self.page.main_frame),
+                "documentUrl": document_url,
+                "navigationId": self.navigation_id,
             },
             key=f"req:{request.method}:{request.url}",
         )
 
     def _on_response(self, response: Response) -> None:
-        if not self.collect_network:
+        if not self.collect_network or _is_extension_url(response.url):
             return
         request = response.request
         info = self.requests.get(request, {})
+        if info and info.get("navigationId") != self.navigation_id:
+            self.requests.pop(request, None)
+            return
         self._emit(
             "response",
             {
@@ -141,6 +166,8 @@ class Tab:
                 "url": response.url,
                 "mimeType": _safe_header(response, "content-type"),
                 "resourceType": info.get("resourceType", request.resource_type),
+                "documentUrl": info.get("documentUrl"),
+                "navigationId": info.get("navigationId", self.navigation_id),
             },
             key=f"resp:{response.url}:{response.status}",
         )
@@ -149,9 +176,11 @@ class Tab:
         self.requests.pop(request, None)
 
     def _on_request_failed(self, request: Request) -> None:
-        if not self.collect_network:
+        if not self.collect_network or _is_extension_url(request.url):
             return
         info = self.requests.pop(request, {})
+        if info and info.get("navigationId") != self.navigation_id:
+            return
         self._emit(
             "requestfailed",
             {
@@ -159,6 +188,8 @@ class Tab:
                 "method": info.get("method", request.method),
                 "failure": request.failure or "unknown",
                 "resourceType": info.get("resourceType", request.resource_type),
+                "documentUrl": info.get("documentUrl"),
+                "navigationId": info.get("navigationId", self.navigation_id),
             },
             key=f"fail:{request.url}:{request.failure}",
         )
@@ -166,6 +197,9 @@ class Tab:
     def _on_frame_navigated(self, frame: Frame) -> None:
         if frame != self.page.main_frame:
             return
+        # Bump first: events from the previous document that arrive late are
+        # tagged with the old id and dropped from this command's delta.
+        self.navigation_id += 1
         self._emit("navigation", {"url": frame.url}, key="navigation")
 
     def _on_load(self, _page: Page) -> None:
@@ -259,6 +293,19 @@ class Tab:
             raise DialogError(f"could not handle dialog: {error}") from error
         return {"handled": True, "accepted": accept, "kind": info.get("kind")}
 
+    async def challenge(self) -> dict[str, Any] | None:
+        try:
+            info = await self.evaluate_fn(
+                """() => ({
+                  title: document.title,
+                  text: (document.body ? document.body.innerText : '').slice(0, 8000),
+                })""",
+                timeout_ms=5_000,
+            )
+        except Exception:  # noqa: BLE001 - challenge detection is best effort
+            return None
+        return detect_challenge(info.get("title"), info.get("text"))
+
     # -- evaluation --------------------------------------------------------
 
     def _js(self, script: str) -> str:
@@ -334,6 +381,30 @@ class NoDialogError(RuntimeError):
 
 class DialogError(RuntimeError):
     pass
+
+
+EXTENSION_PREFIXES = (
+    "moz-extension://",
+    "chrome-extension://",
+    "safari-extension://",
+    "safari-web-extension://",
+    "ms-browser-extension://",
+    "edge-extension://",
+)
+
+
+def _is_extension_url(value: str | None) -> bool:
+    if not value:
+        return False
+    lowered = value.lower()
+    return any(lowered.startswith(prefix) for prefix in EXTENSION_PREFIXES)
+
+
+def _request_document_url(request: Request, fallback: str) -> str:
+    try:
+        return request.frame.url or fallback
+    except Exception:  # noqa: BLE001 - detached frames
+        return fallback
 
 
 def _safe_header(response: Response, name: str) -> str | None:

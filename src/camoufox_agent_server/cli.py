@@ -11,7 +11,7 @@ from urllib.parse import unquote, urlparse
 
 import uvicorn
 
-from .browser import display_available, resolve_profile
+from .browser import display_available, locked_by, resolve_profile
 from .config import (
     DEFAULT_DIALOG_TIMEOUT_MS,
     DEFAULT_HTTP_PORT,
@@ -170,6 +170,7 @@ def options_from_args(args: argparse.Namespace) -> ServerOptions:
         settle_ms=args.settle_ms,
         dialog_timeout_ms=args.dialog_timeout,
         debug=args.debug,
+        fail_fast=True,
     )
 
 
@@ -197,6 +198,17 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    holder = locked_by(options.browser.profile)
+    if holder is not None:
+        print(
+            f"profile {options.browser.profile} is already in use by pi-camoufox "
+            f"(pid {holder}).\n"
+            "  * stop that server first, or\n"
+            "  * use a different profile with --profile.",
+            file=sys.stderr,
+        )
+        return 1
+
     app = create_app(options)
 
     print(f"pi-camoufox listening on http://{options.host}:{options.http_port}")

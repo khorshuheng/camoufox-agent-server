@@ -87,11 +87,19 @@ SNAPSHOT_JS = r"""
 
   // Continue numbering after the highest ref already present so a newly added
   // element can never collide with an existing ref when DOM order changes.
+  // Walk open shadow roots too: components frequently keep their controls there.
   let refCounter = 0;
-  for (const el of document.querySelectorAll('[' + REF_ATTR + ']')) {
-    const n = Number((el.getAttribute(REF_ATTR) || '').replace(/^e/, ''));
-    if (Number.isFinite(n) && n > refCounter) refCounter = n;
-  }
+  const seenRefs = new Set();
+  const scanRefs = (node) => {
+    for (const el of node.querySelectorAll('*')) {
+      if (seenRefs.has(el)) continue;
+      seenRefs.add(el);
+      const n = Number((el.getAttribute(REF_ATTR) || '').replace(/^e/, ''));
+      if (Number.isFinite(n) && n > refCounter) refCounter = n;
+      if (el.shadowRoot) scanRefs(el.shadowRoot);
+    }
+  };
+  scanRefs(document);
 
   const out = [];
   const counts = {};
@@ -154,9 +162,11 @@ SNAPSHOT_JS = r"""
       counts[role] = (counts[role] || 0) + 1;
     }
     for (const child of el.children) visit(child);
+    if (el.shadowRoot) for (const child of el.shadowRoot.children) visit(child);
   };
 
   for (const child of root ? root.children : []) visit(child);
+  if (root && root.shadowRoot) for (const child of root.shadowRoot.children) visit(child);
 
   return {
     url: location.href,

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import mimetypes
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -59,9 +60,26 @@ def selector_for(params: dict[str, Any]) -> str:
     )
 
 
+def _frame_root(tab: Tab, frame: Any) -> Any:
+    target: Any = tab.page
+    frames = frame if isinstance(frame, list) else [frame]
+    for frame_selector in frames:
+        target = target.frame_locator(str(frame_selector))
+    return target
+
+
 def locator_for(tab: Tab, params: dict[str, Any]) -> tuple[Locator, str]:
+    """Resolve a ref/selector, optionally inside one or more iframes.
+
+    ``frame`` is a CSS selector for the iframe, or a list of selectors for
+    nested frames. Playwright's frame locator pierces same- and cross-origin
+    iframes, so the rest of the action layer is unchanged.
+    """
     selector = selector_for(params)
-    return tab.page.locator(selector).first, selector
+    frame = params.get("frame")
+    if not frame:
+        return tab.page.locator(selector).first, selector
+    return _frame_root(tab, frame).locator(selector).first, selector
 
 
 def _translate_locator_error(error: Exception, selector: str) -> ActionError:
@@ -124,6 +142,18 @@ def _timeout(params: dict[str, Any], default: int = DEFAULT_TIMEOUT) -> int:
         return default
 
 
+async def _poll_until(predicate: Any, timeout_ms: int, interval: float = 0.1) -> bool:
+    deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
+    while asyncio.get_running_loop().time() < deadline:
+        value = predicate()
+        if inspect.isawaitable(value):
+            value = await value
+        if value:
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
@@ -156,7 +186,77 @@ async def navigate(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
             code="navigation_failed",
             details={"url": str(url)},
         ) from error
-    return {"url": tab.url, "status": response.status if response else None}
+
+    wait_timeout = _timeout(params, timeout)
+    timed_out = None
+    if params.get("waitFor"):
+        wait_selector = str(params["waitFor"])
+        try:
+            wait_locator, _ = locator_for(
+                tab, {"selector": wait_selector, "frame": params.get("frame")}
+            )
+            await wait_locator.wait_for(
+                state=str(params.get("waitState") or "visible"), timeout=wait_timeout
+            )
+        except PlaywrightError:
+            timed_out = f"selector:{wait_selector}"
+    if params.get("waitForText"):
+        wait_text = str(params["waitForText"])
+        try:
+            await tab.page.wait_for_function(
+                "(text) => document.body && document.body.innerText.includes(text)",
+                arg=wait_text,
+                timeout=wait_timeout,
+            )
+        except PlaywrightError:
+            timed_out = f"text:{wait_text}"
+    if params.get("waitForUrl"):
+        wait_url = str(params["waitForUrl"])
+        found = await _poll_until(lambda: wait_url in tab.url, wait_timeout)
+        if not found:
+            timed_out = f"url:{wait_url}"
+
+    result: dict[str, Any] = {
+        "url": tab.url,
+        "status": response.status if response else None,
+    }
+    if timed_out:
+        result["waitForTimedOut"] = timed_out
+    return result
+
+
+BLOCKER_JS = r"""
+(args) => {
+  const top = document.elementFromPoint(args.x, args.y);
+  if (!top) return { blocked: false };
+  const target = document.querySelector(args.selector);
+  if (target && (top === target || target.contains(top) || top.contains(target))) {
+    return { blocked: false };
+  }
+  return {
+    blocked: true,
+    blocker: {
+      tag: top.tagName,
+      id: top.id || null,
+      class: String(top.className || '').slice(0, 120),
+      role: top.getAttribute('role') || null,
+      text: (top.innerText || '').replace(/\s+/g, ' ').trim().slice(0, 160),
+    },
+  };
+}
+"""
+
+
+async def _blocker_at(tab: Tab, box: dict[str, Any], selector: str) -> dict[str, Any] | None:
+    x = box["x"] + box["width"] / 2
+    y = box["y"] + box["height"] / 2
+    try:
+        probe = await tab.evaluate_fn(
+            BLOCKER_JS, {"x": x, "y": y, "selector": selector}, timeout_ms=3000
+        )
+    except Exception:  # noqa: BLE001 - diagnostics are best effort
+        return None
+    return probe.get("blocker") if probe and probe.get("blocked") else None
 
 
 async def click(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
@@ -165,17 +265,33 @@ async def click(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
     if button not in ("left", "right", "middle"):
         raise ActionError(f'unsupported button "{button}"', code="bad_request")
     timeout = _timeout(params)
+    force = bool(params.get("force"))
     box = None
     try:
         box = await locator.bounding_box(timeout=timeout)
     except PlaywrightError:
         pass
-    await _locator_action(
-        locator.click(
-            button=button, click_count=int(params.get("clickCount") or 1), timeout=timeout
-        ),
-        selector,
-    )
+    try:
+        await locator.click(
+            button=button,
+            click_count=int(params.get("clickCount") or 1),
+            timeout=timeout,
+            force=force,
+        )
+    except PlaywrightError as error:
+        if box and not force and not params.get("frame"):
+            blocker = await _blocker_at(tab, box, selector)
+            if blocker:
+                raise ActionError(
+                    f"element {selector} is covered by <{blocker['tag'].lower()}>",
+                    code="blocked",
+                    details={
+                        "selector": selector,
+                        "blocker": blocker,
+                        "hint": "close the overlay, or retry with force:true",
+                    },
+                ) from error
+        raise _translate_locator_error(error, selector) from error
     if params.get("waitForNav"):
         try:
             await tab.page.wait_for_load_state("load", timeout=timeout)
@@ -372,6 +488,12 @@ async def drop_files(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
     in the page's main world: build a DataTransfer with real File objects, then
     dispatch dragenter/dragover/drop on the target.
     """
+    if params.get("frame"):
+        raise ActionError(
+            "dropFiles does not support frame yet; use setFiles on the file input",
+            code="bad_request",
+            details={"hint": "dropFiles dispatches a DataTransfer in the main document"},
+        )
     locator, selector = locator_for(tab, params)
     files = params.get("files")
     file_list = (
@@ -399,6 +521,283 @@ async def drop_files(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
             details={"selector": selector},
         )
     return {"files": file_list, "target": selector}
+
+
+EXTRACT_JS = r"""
+(args) => {
+  const deepAll = (root, selector) => {
+    const out = [];
+    const walk = (node) => {
+      for (const el of node.querySelectorAll('*')) {
+        if (el.matches(selector)) out.push(el);
+        if (el.shadowRoot) walk(el.shadowRoot);
+      }
+    };
+    walk(root);
+    return out;
+  };
+  const textOf = (el) => (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  const first = (root, selector) => {
+    if (!selector) return root;
+    if (root.matches && root.matches(selector)) return root;
+    return deepAll(root, selector)[0] || null;
+  };
+  const root = args.scope ? document.querySelector(args.scope) : document;
+  if (!root) return { count: 0, rows: [], error: 'scope-not-found' };
+  const rows = deepAll(root, args.selector);
+  const read = (el, spec) => {
+    if (!el) return null;
+    if (spec.attr) return el.getAttribute(spec.attr);
+    if (spec.html) return el.innerHTML;
+    if (spec.value) return ('value' in el ? el.value : null);
+    return textOf(el);
+  };
+  const pick = (row, rawSpec) => {
+    const spec = typeof rawSpec === 'string' ? { selector: rawSpec } : (rawSpec || {});
+    if (spec.all) {
+      const selector = spec.selector || '*';
+      return deepAll(row, selector).map((el) => read(el, spec));
+    }
+    return read(first(row, spec.selector || null), spec);
+  };
+  const limit = Math.max(1, Math.min(Number(args.limit) || 100, 500));
+  const out = rows.slice(0, limit).map((row) => {
+    const item = {};
+    for (const [key, spec] of Object.entries(args.fields || {})) item[key] = pick(row, spec);
+    if (args.includeText) item.text = textOf(row).slice(0, Number(args.maxText) || 500);
+    return item;
+  });
+  return {
+    count: rows.length,
+    rows: out,
+    truncated: rows.length > limit || undefined,
+  };
+}
+"""
+
+
+def _field_spec(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, str):
+        return {"selector": raw}
+    if isinstance(raw, dict):
+        return raw
+    raise ActionError(
+        "extract field specs must be a selector string or an object", code="bad_request"
+    )
+
+
+async def _extract_with_locator(
+    tab: Tab, selector: str, fields: dict[str, Any], params: dict[str, Any], limit: int
+) -> dict[str, Any]:
+    frame = params.get("frame")
+    rows = _frame_root(tab, frame).locator(selector) if frame else tab.page.locator(selector)
+    total = await rows.count()
+    out = []
+    for index in range(min(total, limit)):
+        row = rows.nth(index)
+        item: dict[str, Any] = {}
+        for key, raw_spec in fields.items():
+            spec = _field_spec(raw_spec)
+            target = row if not spec.get("selector") else row.locator(str(spec["selector"])).first
+            try:
+                if spec.get("all"):
+                    all_target = (
+                        row if not spec.get("selector") else row.locator(str(spec["selector"]))
+                    )
+                    values = await all_target.all_inner_texts()
+                    item[key] = [value.strip() for value in values]
+                elif spec.get("attr"):
+                    item[key] = await target.get_attribute(str(spec["attr"]), timeout=3000)
+                elif spec.get("html"):
+                    item[key] = await target.inner_html(timeout=3000)
+                elif spec.get("value"):
+                    item[key] = await target.input_value(timeout=3000)
+                else:
+                    item[key] = (await target.inner_text(timeout=3000)).strip()
+            except PlaywrightError:
+                item[key] = None
+        if params.get("includeText"):
+            try:
+                item["text"] = (await row.inner_text(timeout=3000)).strip()[
+                    : int(params.get("maxText") or 500)
+                ]
+            except PlaywrightError:
+                item["text"] = None
+        out.append(item)
+    result = {"count": total, "rows": out}
+    if total > limit:
+        result["truncated"] = True
+    return result
+
+
+async def extract(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
+    selector = params.get("selector")
+    fields = params.get("fields")
+    if not selector:
+        raise ActionError('extract requires "selector" for the repeated rows', code="bad_request")
+    if not isinstance(fields, dict) or not fields:
+        raise ActionError('extract requires a non-empty "fields" object', code="bad_request")
+    limit = max(1, min(int(params.get("limit") or 100), 500))
+    wait_ms = max(0, min(int(params.get("timeoutMs") or 0), 120_000))
+    if wait_ms > 0:
+        try:
+            await locator_for(tab, {"selector": str(selector), "frame": params.get("frame")})[
+                0
+            ].wait_for(state="attached", timeout=wait_ms)
+        except PlaywrightError:
+            if params.get("required"):
+                raise ActionError(
+                    f"no elements matching {selector} appeared within {wait_ms}ms",
+                    code="not_found",
+                    details={"selector": str(selector)},
+                ) from None
+    if params.get("frame"):
+        return await _extract_with_locator(tab, str(selector), fields, params, limit)
+    result = await tab.evaluate_fn(
+        EXTRACT_JS,
+        {
+            "selector": str(selector),
+            "fields": {key: _field_spec(value) for key, value in fields.items()},
+            "limit": limit,
+            "scope": params.get("scope"),
+            "includeText": bool(params.get("includeText")),
+            "maxText": int(params.get("maxText") or 500),
+        },
+        timeout_ms=_timeout(params, 20_000),
+    )
+    return result or {"count": 0, "rows": []}
+
+
+FIND_OVERLAY_JS = r"""
+(args) => {
+  const deepAll = (root, selector) => {
+    const out = [];
+    const walk = (node) => {
+      for (const el of node.querySelectorAll('*')) {
+        if (el.matches(selector)) out.push(el);
+        if (el.shadowRoot) walk(el.shadowRoot);
+      }
+    };
+    walk(root);
+    return out;
+  };
+  const visible = (el) => {
+    if (!el || el.disabled) return false;
+    const cs = getComputedStyle(el);
+    if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') return false;
+    const r = el.getBoundingClientRect();
+    return r.width > 0 && r.height > 0;
+  };
+  const nameOf = (el) => (
+    el.getAttribute('aria-label') || el.getAttribute('title') ||
+    el.innerText || el.textContent || ''
+  ).replace(/\s+/g, ' ').trim().toLowerCase();
+  const overlayish = (el) => {
+    let node = el;
+    for (let i = 0; i < 4 && node; i += 1, node = node.parentElement) {
+      const cls = typeof node.className === 'string' ? node.className : '';
+      const testId = node.getAttribute('data-testid') || '';
+      const role = node.getAttribute('role') || '';
+      const blob = `${cls} ${node.id || ''} ${role} ${testId}`.toLowerCase();
+      if (/cookie|consent|modal|overlay|dialog|popup|banner|gdpr/.test(blob)) return true;
+    }
+    return false;
+  };
+  const labels = (args.labels || []).map((s) => s.toLowerCase());
+  const dialogs = deepAll(document, '[role="dialog"],[aria-modal="true"]');
+  const controls = deepAll(
+    document,
+    'button,a,[role="button"],input[type="button"],input[type="submit"]'
+  );
+  for (const el of controls) {
+    if (!visible(el)) continue;
+    const name = nameOf(el);
+    const matched = labels.some((label) => name === label || name.includes(label));
+    if (!matched) continue;
+    if (!overlayish(el) && !dialogs.some((dialog) => dialog.contains(el))) continue;
+    el.setAttribute('data-cf-dismiss', '1');
+    return { found: true, label: name, tag: el.tagName };
+  }
+  return { found: false };
+}
+"""
+
+DEFAULT_DISMISS_LABELS = [
+    "close",
+    "dismiss",
+    "no thanks",
+    "not now",
+    "maybe later",
+    "got it",
+    "continue without accepting",
+    "skip",
+    "×",
+]
+COOKIE_ACCEPT_LABELS = [
+    "accept all",
+    "accept cookies",
+    "i agree",
+    "agree",
+    "allow all",
+    "accept",
+]
+
+
+async def close_overlays(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
+    labels = [str(label) for label in params.get("labels") or DEFAULT_DISMISS_LABELS]
+    if params.get("acceptCookies"):
+        labels.extend(COOKIE_ACCEPT_LABELS)
+    max_clicks = max(0, min(int(params.get("max") or 5), 20))
+    clicked: list[str] = []
+    for _ in range(max_clicks):
+        try:
+            found = await tab.evaluate_fn(
+                FIND_OVERLAY_JS, {"labels": labels}, timeout_ms=_timeout(params, 5_000)
+            )
+        except Exception:  # noqa: BLE001 - overlay cleanup is best effort
+            break
+        if not found or not found.get("found"):
+            break
+        control = tab.page.locator('[data-cf-dismiss="1"]').first
+        handled = False
+        for attempt in (False, True):
+            try:
+                await control.click(timeout=2_000, force=attempt)
+                handled = True
+                break
+            except PlaywrightError:
+                continue
+        if not handled:
+            try:
+                await control.evaluate("(el) => el.click()")
+                handled = True
+            except PlaywrightError:
+                handled = False
+        await tab.evaluate_fn(
+            "() => document.querySelectorAll('[data-cf-dismiss]').forEach("
+            "(el) => el.removeAttribute('data-cf-dismiss'))",
+            timeout_ms=3_000,
+        )
+        if not handled:
+            break
+        clicked.append(str(found.get("label") or found.get("tag") or "overlay"))
+        await asyncio.sleep(0.2)
+    return {"clicked": clicked, "count": len(clicked)}
+
+
+async def click_at(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
+    try:
+        x = float(params["x"])
+        y = float(params["y"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ActionError('clickAt requires numeric "x" and "y"', code="bad_request") from error
+    button = str(params.get("button") or "left")
+    if button not in ("left", "right", "middle"):
+        raise ActionError(f'unsupported button "{button}"', code="bad_request")
+    steps = max(1, min(int(params.get("steps") or 8), 100))
+    await tab.page.mouse.move(x, y, steps=steps)
+    await tab.page.mouse.click(x, y, button=button, click_count=int(params.get("clickCount") or 1))
+    return {"clicked": True, "at": {"x": round(x), "y": round(y)}}
 
 
 async def screenshot(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
@@ -441,9 +840,36 @@ async def wait(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
     timeout = _timeout(params)
     if params.get("forSelector"):
         selector = str(params["forSelector"])
-        locator = tab.page.locator(selector).first
+        min_count = int(params.get("minCount") or 0)
+        frame = params.get("frame")
+        if min_count > 0:
+            if frame:
+                locator = _frame_root(tab, frame).locator(selector)
+
+                async def enough() -> bool:
+                    return await locator.count() >= min_count
+
+                found = await _poll_until(enough, timeout)
+            else:
+                try:
+                    await tab.page.wait_for_function(
+                        "([sel, n]) => document.querySelectorAll(sel).length >= n",
+                        arg=[selector, min_count],
+                        timeout=timeout,
+                    )
+                    found = True
+                except PlaywrightTimeoutError:
+                    found = False
+            if not found:
+                raise ActionError(
+                    f"fewer than {min_count} elements match {selector} within {timeout}ms",
+                    code="not_found",
+                    details={"selector": selector, "minCount": min_count},
+                )
+            return {"found": True, "count": min_count}
+        locator, _ = locator_for(tab, {"selector": selector, "frame": frame})
         try:
-            await locator.wait_for(state="visible", timeout=timeout)
+            await locator.wait_for(state=str(params.get("state") or "visible"), timeout=timeout)
         except PlaywrightError as error:
             raise _translate_locator_error(error, selector) from error
         return {"found": True}
@@ -460,6 +886,33 @@ async def wait(tab: Tab, params: dict[str, Any]) -> dict[str, Any]:
                 f"text {text!r} not found within {timeout}ms", code="not_found"
             ) from error
         return {"found": True}
+    if params.get("forUrl"):
+        needle = str(params["forUrl"])
+        if not await _poll_until(lambda: needle in tab.url, timeout):
+            raise ActionError(
+                f"URL never contained {needle!r} within {timeout}ms",
+                code="not_found",
+                details={"url": tab.url},
+            )
+        return {"found": True, "url": tab.url}
+    if params.get("forFunction"):
+        expression = str(params["forFunction"])
+        try:
+            await tab.page.wait_for_function(expression, timeout=timeout)
+        except PlaywrightError as error:
+            raise ActionError(
+                f"condition {expression!r} was not truthy within {timeout}ms",
+                code="not_found",
+            ) from error
+        return {"found": True}
+    if params.get("forNetworkIdle"):
+        try:
+            await tab.page.wait_for_load_state("networkidle", timeout=timeout)
+        except PlaywrightTimeoutError as error:
+            raise ActionError(
+                f"network did not become idle within {timeout}ms", code="timeout"
+            ) from error
+        return {"idle": True}
     milliseconds = max(0, min(int(params.get("ms") or 500), MAX_WAIT_MS))
     await asyncio.sleep(milliseconds / 1000)
     return {"waited": milliseconds}
@@ -568,6 +1021,9 @@ ACTIONS: dict[str, ActionFn] = {
     "getText": get_text,
     "getHtml": get_html,
     "snapshot": snapshot,
+    "extract": extract,
+    "closeOverlays": close_overlays,
+    "clickAt": click_at,
     "history": history,
     "reload": reload,
     "acceptDialog": accept_dialog,
@@ -591,6 +1047,9 @@ ACTION_DESCRIPTIONS: dict[str, str] = {
     "getText": "Read innerText from a ref/selector.",
     "getHtml": "Read innerHTML (or the whole page when no target is given).",
     "snapshot": "Return a compact snapshot as the action result.",
+    "extract": "Extract compact rows from repeated elements using a selector and field map.",
+    "closeOverlays": "Close visible cookie/login/dialog overlays (acceptCookies optional).",
+    "clickAt": "Click viewport coordinates (x, y); useful for canvas and iframe widgets.",
     "history": "Navigate back or forward.",
     "reload": "Reload the current page.",
     "acceptDialog": "Accept or dismiss the pending JavaScript dialog.",
@@ -603,6 +1062,7 @@ READ_ONLY = {
     "getHtml",
     "screenshot",
     "wait",
+    "extract",
 }
 
 

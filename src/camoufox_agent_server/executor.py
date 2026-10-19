@@ -26,6 +26,8 @@ CHANGE_ACTIONS = {
     "reload",
     "scroll",
     "wait",
+    "closeOverlays",
+    "clickAt",
 }
 OBSERVE_MODES = {"auto", "always", "never", "full"}
 
@@ -111,7 +113,7 @@ class Executor:
                 await self._settle(tab, budget)
 
             events, cursor, _dropped = tab.events.since(cursor)
-            events = _for_tab(events, tab.id)
+            events = _for_tab(events, tab)
 
             entry: dict[str, Any] = {
                 "i": index,
@@ -186,8 +188,24 @@ class Executor:
             return {"error": str(error)}
 
 
-def _for_tab(events: list[Event], tab_id: str) -> list[Event]:
-    return [event for event in events if event["data"].get("tabId") == tab_id]
+def _for_tab(events: list[Event], tab: Tab) -> list[Event]:
+    """Keep only this tab's events from the current navigation epoch.
+
+    A navigation can leave the previous document's trackers finishing after the
+    new page has committed. Those events belong to the old epoch and would
+    otherwise show up as failures caused by the navigation.
+    """
+    current = tab.navigation_id
+    out = []
+    for event in events:
+        data = event["data"]
+        if data.get("tabId") != tab.id:
+            continue
+        navigation_id = data.get("navigationId")
+        if navigation_id is not None and navigation_id != current:
+            continue
+        out.append(event)
+    return out
 
 
 def _error_payload(error: ActionError) -> dict[str, Any]:

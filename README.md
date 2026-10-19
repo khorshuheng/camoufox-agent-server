@@ -158,13 +158,14 @@ dialogs are auto-dismissed after `--dialog-timeout` (default 30 s, `0` = never).
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/` | Route index |
-| `GET` | `/health` | Browser version, profile, tabs, pending dialogs, cursor |
+| `GET` | `/health` | Browser version, profile, tabs, pending dialogs, cursor (`?challenges=1` also checks each tab) |
 | `GET` | `/actions` | Action vocabulary |
 | `GET` | `/tabs` | List tabs (most-recently-used marked `active`) |
 | `POST` | `/tabs` | Open a tab `{"url": "..."}` |
 | `DELETE` | `/tabs/:id` | Close a tab |
 | `POST` | `/tabs/:id/focus` | Raise the headed window |
 | `GET` | `/tabs/:id/snapshot` | Compact snapshot (`?maxNodes=&scope=&includeText=`) |
+| `GET` | `/tabs/:id/challenge` | Heuristic challenge/captcha detection |
 | `POST` | `/tabs/:id/act` | Run one action |
 | `POST` | `/tabs/:id/batch` | **Run N actions → N deltas** (hot path) |
 | `GET` | `/tabs/:id/dialog` | Pending JavaScript dialog, if any |
@@ -197,7 +198,8 @@ open. New tabs (including popups) are adopted automatically.
 Refs are stored on the element as `data-cf-ref`. They are handles, not CSS:
 act on them with `{"ref": "e6"}`. If the page changed and an element is gone,
 the action fails with `code: "not_found"` and the response includes a fresh
-snapshot so the agent can re-target in the same turn.
+snapshot so the agent can re-target in the same turn. Open shadow roots are
+included in snapshots and in ref-based actions.
 
 ### Batch response
 
@@ -218,8 +220,8 @@ Malformed requests, unknown tabs and invalid bodies use 4xx.
 
 | Action | What it does |
 | --- | --- |
-| `navigate` | Go to a URL (`waitUntil`: `commit`, `domcontentloaded`, `load`, `networkidle`, `none`) |
-| `click` | Click a ref/selector (`button`, `clickCount`, `waitForNav`) |
+| `navigate` | Go to a URL (`waitUntil`: `commit`, `domcontentloaded`, `load`, `networkidle`, `none`); `waitFor`/`waitForText`/`waitForUrl` | 
+| `click` | Click a ref/selector (`button`, `clickCount`, `waitForNav`, `force`) |
 | `fill` | Focus and replace a field (`value`, `clear`, `pressEnter`, `delay`) |
 | `type` | Type without clearing (`text`, `delay`) |
 | `press` | Press a key (`Enter`, `Tab`, `Control+a`, ...) |
@@ -230,17 +232,44 @@ Malformed requests, unknown tabs and invalid bodies use 4xx.
 | `setFiles` | Set files on an `<input type="file">` |
 | `dropFiles` | Drop files on a dropzone via dragenter/dragover/drop |
 | `screenshot` | Capture PNG/JPEG; returns an artifact handle |
-| `wait` | Wait for `ms`, `forSelector`, or `forText` |
+| `wait` | Wait for `ms`, `forSelector` (+`minCount`/`state`), `forText`, `forUrl`, `forFunction`, or `forNetworkIdle` |
 | `evaluate` | Evaluate a JS expression in the page |
 | `getText` | Read `innerText` from a ref/selector |
 | `getHtml` | Read `innerHTML` (or the whole page with no target) |
 | `snapshot` | Return a snapshot as the action result |
+| `extract` | Extract compact rows from repeated elements with a selector + field map |
+| `closeOverlays` | Close cookie/login/dialog overlays (`acceptCookies`, `labels`, `max`) |
+| `clickAt` | Click viewport coordinates (`x`, `y`); useful for canvas and iframe widgets |
 | `history` | `direction: "back"` or `"forward"` |
 | `reload` | Reload the page |
 | `acceptDialog` | Accept/dismiss the pending JS dialog |
 
 Actions accept either a `ref` from a snapshot or a CSS `selector`. Playwright
 dispatches input through Juggler, so Camoufox sees native input handling.
+Add `"frame": "#iframe-selector"` (or a list for nested frames) to target a
+control inside an iframe. `clickAt` is the coordinate fallback for canvas and
+cross-origin widgets. `dropFiles` is main-document only; use `setFiles` for a
+file input inside an iframe.
+
+`extract` is the fast path for list pages:
+
+```json
+{"action":"extract","selector":"[data-testid=property-card]",
+ "fields":{"title":"[data-testid=title]",
+           "price":"[data-testid=price-and-discounted-price]",
+           "link":{"selector":"a","attr":"href"}},
+ "limit":30}
+```
+
+A field is a selector string, or an object with `selector` plus `attr`, `html`,
+`value`, or `all`. `includeText` adds the row's collapsed text. `scope`
+restricts the row search, `timeoutMs` optionally waits for rows, and `required`
+turns an empty result into a `not_found` error.
+
+`closeOverlays` only clicks controls inside dialog/cookie/modal-looking
+containers. It does not accept cookies unless `acceptCookies: true`. If a click
+is covered, it fails immediately with `code: "blocked"` and a `blocker`
+description rather than waiting out the action timeout.
 
 `setFiles` and `dropFiles` accept absolute host paths. `dropFiles` builds real
 `File` objects in the page's main world, which is why it needs main-world
@@ -255,6 +284,22 @@ hundreds of KB of base64.
 Event types: `console`, `pageerror`, `request`, `response`, `requestfailed`,
 `navigation`, `load`, `domcontentloaded`, `dialog`, `dialogtimeout`, `download`,
 `popup`, `tab`, `tabclosed`, `crash`, `browser`.
+
+Per-command deltas are scoped to the current tab and navigation epoch: tracker
+failures from the previous document and messages from browser extensions
+(`moz-extension://`, `chrome-extension://`) are filtered out.
+
+### Challenge detection
+
+```bash
+curl -s localhost:8787/tabs/default/challenge
+# {"id":"t1","url":"...","challenge":{"detected":true,"kind":"cloudflare",...}}
+curl -s 'localhost:8787/health?challenges=1'
+```
+
+The detector is heuristic (title/body phrases for Cloudflare, captcha and access
+screens). When it fires, stop acting, call `/focus`, ask the user to solve it,
+and poll the snapshot/health afterwards.
 
 ```bash
 curl -N 'localhost:8787/tabs/default/events?cursor=0'
@@ -274,14 +319,42 @@ that tab's events plus the next cursor and a `more` flag.
 ## Profile and identity
 
 - Default profile: `~/.camoufox-agent/profile` (`--profile`, `CAMOUFOX_PROFILE`).
-- It is a real persistent Firefox profile: cookies, logins, local storage and
-  `about:config` state survive restarts.
+- It is a real persistent Firefox profile: cookies, logins, local storage,
+  history and `about:config` state survive restarts.
 - A fingerprint is drawn once and stored in `fingerprint.json` beside the
   profile. Camoufox would otherwise draw a new identity on every launch, which
   makes a persistent profile incoherent. Override the target OS with `--os`
   (default: the host OS); changing it draws a new identity. `--rotate-fingerprint`
   forces a new one.
 - The fingerprint is a normal fpgen fingerprint generated by Camoufox itself.
+
+### Keeping the profile consistent
+
+Use the same `--profile` across runs; that is the whole point. A stable profile
+keeps cookies, logins, history, and the exact identity (UA, screen, WebGL,
+canvas, audio and font metrics stay put across restarts). `/health` reports
+`browser.fingerprint.reused: true` from the second launch onward.
+
+A brand-new profile still looks brand-new. Warm it with ordinary browsing
+before putting it to work:
+
+```bash
+make warm        # or: uv run python scripts/warm_profile.py http://127.0.0.1:8787
+```
+
+The helper visits Google, Wikipedia, GitHub, YouTube, Reddit, Hacker News,
+Stack Overflow and BBC News, and accepts an obvious cookie-consent screen. It
+does not log in anywhere. Pass `--site URL` (repeatable) to choose your own.
+
+One server per profile: the profile contains a `server.pid` lock. A second
+server pointed at the same profile refuses to start with an actionable message
+instead of corrupting the profile. If a server was killed hard, the next start
+sees a dead pid and reclaims the lock; a recycled pid is checked against the
+process command line.
+
+Do not change `--os` on an established profile unless you intend to rotate the
+identity, and do not run `--rotate-fingerprint` casually: both make the profile
+look like a different machine.
 
 ## Stealth notes
 
@@ -347,6 +420,7 @@ Environment: `HTTP_PORT`, `HOST`, `CAMOUFOX_PROFILE`, `CAMOUFOX_OS`,
 | `browser` | Download the Camoufox build |
 | `doctor` | Show uv, Camoufox, Playwright and browser state |
 | `start` / `start-headless` / `start-virtual` | Run the server |
+| `warm` | Visit common sites to seed profile cookies/history |
 | `demo` | Run the example agent loop |
 | `lint` / `format` / `format-check` / `check` | Ruff and syntax checks |
 | `test` / `test-headed` | Hermetic browser tests |
@@ -381,9 +455,11 @@ src/camoufox_agent_server/
   executor.py    batch runner, per-command deltas, settling
   events.py      bounded coalescing event bus + summarizer
   server.py      FastAPI routes, SSE, artifacts
+  challenge.py   heuristic captcha/challenge detection
   cli.py         pi-camoufox entry point
 tests/           pytest suite + local fixtures
 examples/        agent loop example
+scripts/         warm_profile.py (seed a new profile)
 skills/          pi skill for this server
 ```
 

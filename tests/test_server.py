@@ -367,3 +367,166 @@ async def test_unknown_tab_is_404(client: httpx.AsyncClient) -> None:
     response = await client.get("/tabs/t999/snapshot")
     assert response.status_code == 404
     assert "unknown tab" in response.json()["error"]
+
+
+async def test_extract_rows(client: httpx.AsyncClient, web_server: str) -> None:
+    await act(client, action="navigate", url=web(web_server, "list.html"))
+    out = await act(
+        client,
+        action="extract",
+        selector=".card",
+        scope="#hotels",
+        limit=2,
+        includeText=True,
+        fields={
+            "name": ".name",
+            "price": ".price",
+            "href": {"selector": ".link", "attr": "href"},
+            "id": {"attr": "data-id"},
+            "tags": {"selector": ".tag", "all": True},
+        },
+    )
+    assert out["ok"] is True, out
+    result = out["result"]
+    assert result["count"] == 3
+    assert len(result["rows"]) == 2
+    assert result["truncated"] is True
+    assert result["rows"][0]["name"] == "Alpha Hotel"
+    assert result["rows"][0]["href"] == "/alpha"
+    assert result["rows"][0]["id"] == "alpha"
+    assert result["rows"][0]["tags"] == ["central", "pool"]
+    assert result["rows"][1]["tags"] == ["quiet"]
+    assert "Alpha Hotel" in result["rows"][0]["text"]
+
+
+async def test_extract_inside_frame(client: httpx.AsyncClient, web_server: str) -> None:
+    await act(client, action="navigate", url=web(web_server, "frame.html"))
+    out = await act(
+        client,
+        action="extract",
+        frame="#inner",
+        selector="body",
+        fields={"button": "#inner-btn", "result": "#inner-result"},
+    )
+    assert out["ok"] is True, out
+    assert out["result"]["count"] == 1
+    assert out["result"]["rows"][0]["button"] == "Inner action"
+    assert out["result"]["rows"][0]["result"] == "idle"
+
+
+async def test_close_overlays(client: httpx.AsyncClient, web_server: str) -> None:
+    await act(client, action="navigate", url=web(web_server, "overlays.html"))
+    out = await act(client, action="closeOverlays")
+    assert out["ok"] is True, out
+    assert out["result"]["count"] >= 2
+    state = await act(
+        client,
+        action="evaluate",
+        expression=(
+            "({cookie: !!document.querySelector('#cookie'), "
+            "signin: !!document.querySelector('#signin'), title: document.title})"
+        ),
+    )
+    value = state["result"]["value"]
+    assert value["cookie"] is False
+    assert value["signin"] is False
+    assert value["title"] == "Fixture: Overlays", "default must not accept cookies"
+
+
+async def test_close_overlays_can_accept_cookies(
+    client: httpx.AsyncClient, web_server: str
+) -> None:
+    await act(client, action="navigate", url=web(web_server, "overlays.html"))
+    out = await act(client, action="closeOverlays", acceptCookies=True)
+    assert out["ok"] is True, out
+    title = await act(client, action="evaluate", expression="document.title")
+    assert title["result"]["value"] == "Accepted"
+
+
+async def test_click_reports_a_blocker(client: httpx.AsyncClient, web_server: str) -> None:
+    await act(client, action="navigate", url=web(web_server, "covered.html"))
+    out = await act(client, action="click", selector="#target", timeoutMs=1200)
+    assert out["ok"] is False
+    assert out["error"]["code"] == "blocked"
+    assert out["error"]["details"]["blocker"]["tag"] == "DIV"
+    assert "force" in out["error"]["details"]["hint"]
+
+
+async def test_click_at(client: httpx.AsyncClient, web_server: str) -> None:
+    await act(client, action="navigate", url=web(web_server, "coords.html"))
+    out = await act(client, action="clickAt", x=100, y=55)
+    assert out["ok"] is True, out
+    title = await act(client, action="evaluate", expression="document.title")
+    assert title["result"]["value"] == "Coord clicked"
+
+
+async def test_wait_helpers(client: httpx.AsyncClient, web_server: str) -> None:
+    await act(client, action="navigate", url=web(web_server, "dynamic.html"))
+    url = await act(client, action="wait", forUrl="#ready", timeoutMs=5000)
+    assert url["ok"] is True, url
+    count = await act(client, action="wait", forSelector=".item", minCount=2, timeoutMs=5000)
+    assert count["ok"] is True, count
+    function = await act(
+        client,
+        action="wait",
+        forFunction="() => document.querySelector('#status')?.textContent === 'ready'",
+        timeoutMs=5000,
+    )
+    assert function["ok"] is True, function
+
+
+async def test_navigate_wait_for(client: httpx.AsyncClient, web_server: str) -> None:
+    out = await act(
+        client,
+        action="navigate",
+        url=web(web_server, "dynamic.html"),
+        waitFor=".item",
+        timeoutMs=5000,
+    )
+    assert out["ok"] is True, out
+    assert "waitForTimedOut" not in out["result"]
+
+    missed = await act(
+        client,
+        action="navigate",
+        url=web(web_server, "dynamic.html"),
+        waitFor="#never-appears",
+        timeoutMs=800,
+    )
+    assert missed["ok"] is True, missed
+    assert missed["result"]["waitForTimedOut"] == "selector:#never-appears"
+
+
+async def test_challenge_detection(client: httpx.AsyncClient, web_server: str) -> None:
+    await act(client, action="navigate", url=web(web_server, "challenge.html"))
+    response = await client.get("/tabs/default/challenge")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["challenge"]["detected"] is True
+    assert body["challenge"]["kind"] == "cloudflare"
+
+    health = await client.get("/health", params={"challenges": True})
+    assert health.json()["challenges"][0]["challenge"]["detected"] is True
+
+    await act(client, action="navigate", url=web(web_server, "list.html"))
+    ordinary = await client.get("/tabs/default/challenge")
+    assert ordinary.json()["challenge"] is None
+
+
+async def test_shadow_dom_snapshot_and_click(client: httpx.AsyncClient, web_server: str) -> None:
+    await act(client, action="navigate", url=web(web_server, "shadow.html"))
+    snap = await snapshot(client)
+    button = find(snap, role="button", name="Shadow action")
+    assert button, snap
+    out = await act(client, action="click", ref=button["ref"])
+    assert out["ok"] is True, out
+    title = await act(client, action="evaluate", expression="document.title")
+    assert title["result"]["value"] == "Shadow clicked"
+
+
+async def test_actions_inside_an_iframe(client: httpx.AsyncClient, web_server: str) -> None:
+    await act(client, action="navigate", url=web(web_server, "frame.html"))
+    clicked = await act(client, action="click", frame="#inner", selector="#inner-btn")
+    assert clicked["ok"] is True, clicked
+    text = await act(client, action="getText", frame="#inner", selector="#inner-result")
+    assert text["result"]["text"] == "clicked"

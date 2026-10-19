@@ -128,8 +128,10 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         try:
             await manager.start()
-        except Exception as error:  # noqa: BLE001 - /health must still answer
+        except Exception as error:  # noqa: BLE001 - /health can still explain the failure
             log.error("browser launch failed: %s", error)
+            if options.fail_fast:
+                raise
         gc_task = asyncio.create_task(_gc_loop(artifacts))
         try:
             yield
@@ -193,6 +195,7 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
                 "DELETE /tabs/{id}",
                 "POST /tabs/{id}/focus",
                 "GET /tabs/{id}/snapshot",
+                "GET /tabs/{id}/challenge",
                 "POST /tabs/{id}/act",
                 "POST /tabs/{id}/batch",
                 "GET|POST /tabs/{id}/dialog",
@@ -204,8 +207,20 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
         }
 
     @app.get("/health")
-    async def health() -> dict[str, Any]:
-        return await manager.health()
+    async def health(challenges: bool = Query(default=False)) -> dict[str, Any]:
+        body = await manager.health()
+        if challenges and body.get("ok"):
+            tabs = list(manager.tabs.items())
+            results = await asyncio.gather(
+                *(tab.challenge() for _tab_id, tab in tabs),
+                return_exceptions=True,
+            )
+            body["challenges"] = [
+                {"tabId": tab_id, "challenge": result}
+                for (tab_id, _tab), result in zip(tabs, results, strict=True)
+                if result and not isinstance(result, Exception)
+            ]
+        return body
 
     @app.get("/actions")
     async def actions_catalog() -> dict[str, Any]:
@@ -257,6 +272,11 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
             return await tab.snapshot(
                 {"maxNodes": max_nodes, "scope": scope, "includeText": include_text}
             )
+
+    @app.get("/tabs/{tab_id}/challenge")
+    async def challenge(tab_id: str) -> dict[str, Any]:
+        tab = await manager.ensure_tab(tab_id)
+        return {"id": tab.id, "url": tab.url, "challenge": await tab.challenge()}
 
     @app.post("/tabs/{tab_id}/act")
     async def act(tab_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:

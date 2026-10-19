@@ -68,11 +68,80 @@ Prefer a batch for multi-step work: one round trip, one delta per step. Use
 `selector` only when a snapshot has no usable ref, or when you need a locator
 that is not exposed as an interesting node.
 
+### List pages: extract, don't snapshot
+
+For search results, tables and feeds, `extract` is much faster and cheaper than
+a snapshot:
+
+```bash
+curl -s -X POST localhost:8787/tabs/default/batch   -H 'content-type: application/json' -d '{
+    "commands": [
+      {"action":"navigate","url":"https://example.com/search?q=...","waitUntil":"domcontentloaded"},
+      {"action":"wait","forSelector":".result-card","minCount":5,"timeoutMs":15000},
+      {"action":"extract","selector":".result-card","limit":20,
+       "fields":{"title":".title","price":".price",
+                 "link":{"selector":"a","attr":"href"},
+                 "tags":{"selector":".tag","all":true}}}
+    ],
+    "observe":"never"
+  }'
+```
+
+A field is a selector string or an object with `selector` plus `attr`, `html`,
+`value`, or `all`. Add `includeText: true` for the row's collapsed text and
+`scope` to restrict the search. `required: true` turns an empty result into a
+`not_found` error.
+
+### Overlays and blocked clicks
+
+Run `closeOverlays` before interacting with a page that may show a cookie or
+login modal:
+
+```json
+{"action":"closeOverlays"}
+{"action":"closeOverlays","acceptCookies":true}
+```
+
+It only clicks controls inside dialog/cookie/modal-looking containers, so it
+will not randomly accept or dismiss page content. If an action fails with
+`code:"blocked"`, the response includes the covering element and a hint. Close
+the overlay, or use `{"force": true}` on `click` when you know the target is
+correct. For canvas or cross-origin widget iframes, use
+`{"action":"clickAt","x":100,"y":60}`.
+
+### Waits
+
+Prefer event-driven waits over fixed sleeps:
+
+```json
+{"action":"wait","forSelector":".result-card","minCount":5,"timeoutMs":15000}
+{"action":"wait","forText":"Showing results","timeoutMs":10000}
+{"action":"wait","forUrl":"/search","timeoutMs":10000}
+{"action":"wait","forFunction":"() => document.readyState === 'complete'"}
+{"action":"navigate","url":"...","waitUntil":"domcontentloaded","waitFor":".result-card"}
+```
+
+`navigate` accepts `waitFor`, `waitForText` and `waitForUrl`, so a navigation
+plus its first meaningful element can be one command. If a wait misses, it
+returns `waitForTimedOut` instead of discarding a successful navigation.
+
 If an action fails with `code: "not_found"` or `"not_visible"`, the response
 already contains a fresh snapshot. Re-target from it; do not blindly retry the
-old ref.
+old ref. A `blocked` failure means an overlay is covering the target.
+
+Iframes are supported per action with `"frame": "#iframe-selector"` (a list for
+nested frames). Open shadow roots are included in snapshots and work with refs.
 
 ## Captcha, login, 2FA: hand off to the user
+
+Check for a challenge after navigation if the page looks wrong:
+
+```bash
+curl -s localhost:8787/tabs/default/challenge
+```
+
+`challenge.detected` is heuristic but covers the common Cloudflare, captcha and
+access-denied shells. `/health?challenges=1` checks every tab.
 
 The browser is headed. When the page shows a challenge the agent should not
 try to bypass:
@@ -156,6 +225,36 @@ Types: `console`, `pageerror`, `request`, `response`, `requestfailed`,
 Identical console lines and repeated requests coalesce; the frame carries a
 `count`. If a resume cursor is older than the buffer, an `event: dropped` frame
 tells you there is a gap.
+
+## Profile consistency
+
+The server uses a persistent profile by default (`~/.camoufox-agent/profile`):
+cookies, logins, history and the fingerprint survive restarts. Keep using the
+same `--profile`; a new profile looks like a new machine and will be challenged
+more often.
+
+If a profile is fresh, warm it before real work:
+
+```bash
+make warm
+# or: uv run python scripts/warm_profile.py http://127.0.0.1:8787
+```
+
+`/health` reports `browser.fingerprint.reused: true` after the first launch.
+Only one server can use a profile at a time; a second one refuses to start
+(pid lock in the profile). Do not run `--rotate-fingerprint` or change `--os`
+unless a new identity is intended.
+
+## Prices and listings
+
+On booking/OTA pages, the headline price is often the cheapest restricted rate.
+After extracting the list, open the top 2–3 property pages and compare:
+
+- total for the stay vs per-night
+- taxes and charges included or not
+- free cancellation deadline vs non-refundable/prepay
+- room size and bed type
+- whether the listing is marked “Featured” (paid placement)
 
 ## Tabs
 

@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="en">
+  <head><meta charset="utf-8" /><title>Inner frame</title></head>
+  <body>
+    <button id="inner-btn">Inner action</button>
+    <div id="inner-result">idle</div>
+    <script>
+      document.querySelector('#inner-btn').addEventListener('click', () => {
+        document.querySelector('#inner-result').textContent = 'clicked';
+      });
+    </script>
+  </body>
+</html>
