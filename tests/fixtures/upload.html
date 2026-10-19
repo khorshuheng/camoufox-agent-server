@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Fixture: Upload</title>
+    <style>
+      #dropzone {
+        border: 2px dashed #999;
+        padding: 24px;
+        margin-top: 12px;
+      }
+      #dropzone.dropping {
+        border-color: #0a0;
+        background: #efc;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Upload</h1>
+
+    <!-- A normal file input. Its change handler reads event.target.files. -->
+    <label>
+      Receipt
+      <input id="file-input" type="file" />
+    </label>
+    <div id="files-report"></div>
+
+    <!-- Some apps (e.g. Expensify) read the file then clear the input, so
+         input.files is empty afterwards even though the change fired. -->
+    <label>
+      Self-clearing
+      <input id="file-input-reset" type="file" />
+    </label>
+    <div id="reset-report"></div>
+
+    <!-- A dropzone with no file input at all. -->
+    <div id="dropzone">Drop files here</div>
+    <div id="drop-report"></div>
+
+    <script>
+      const names = (list) => Array.from(list || []).map((f) => f.name).join(',');
+
+      document.querySelector('#file-input').addEventListener('change', (e) => {
+        document.querySelector('#files-report').textContent = names(e.target.files);
+      });
+
+      document.querySelector('#file-input-reset').addEventListener('change', (e) => {
+        document.querySelector('#reset-report').textContent = names(e.target.files);
+        e.target.value = ''; // simulate apps that clear the input after reading
+      });
+
+      const zone = document.querySelector('#dropzone');
+      for (const type of ['dragenter', 'dragover']) {
+        zone.addEventListener(type, (e) => {
+          e.preventDefault();
+          zone.classList.add('dropping');
+        });
+      }
+      zone.addEventListener('drop', (e) => {
+        e.preventDefault();
+        zone.classList.remove('dropping');
+        document.querySelector('#drop-report').textContent = names(e.dataTransfer.files);
+      });
+    </script>
+  </body>
+</html>

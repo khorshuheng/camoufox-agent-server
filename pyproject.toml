@@ -1,0 +1,49 @@
+[project]
+name = "camoufox-agent-server"
+version = "0.1.0"
+description = "Headed Camoufox browser control server for coding agents"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "camoufox[geoip]>=0.5.8,<0.6",
+    "fastapi>=0.115",
+    "playwright>=1.55,<1.63",
+    "sse-starlette>=2.1",
+    "uvicorn>=0.30",
+]
+
+[project.scripts]
+pi-camoufox = "camoufox_agent_server.cli:main"
+
+[dependency-groups]
+dev = [
+    "httpx>=0.27",
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/camoufox_agent_server"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC"]
+ignore = ["B008", "B904"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
+testpaths = ["tests"]

@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Fixture: Form</title>
+  </head>
+  <body>
+    <h1>Sign up</h1>
+    <form onsubmit="event.preventDefault(); document.title = 'Submitted';">
+      <label>Email <input id="email" type="email" required /></label>
+      <label>
+        Country
+        <select id="country">
+          <option value="us">USA</option>
+          <option value="sg">Singapore</option>
+        </select>
+      </label>
+      <label><input id="tos" type="checkbox" /> Accept terms</label>
+      <button id="submit" type="submit">Create account</button>
+    </form>
+
+    <div id="hover-target" onmouseover="this.textContent = 'hovered!'">hover me</div>
+    <textarea id="bio"></textarea>
+
+    <button id="flood" onclick="for (let i = 0; i < 200; i++) console.log('repeated log line');">
+      Flood console
+    </button>
+
+    <button id="boom" onclick="throw new Error('intentional explosion')">Boom</button>
+
+    <script>
+      // A little console noise on load to exercise coalescing.
+      for (let i = 0; i < 25; i++) console.log('repeated log line');
+    </script>
+  </body>
+</html>

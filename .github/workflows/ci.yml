@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: make check
+
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Firefox runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-0 libdbus-glib-1-2 libasound2t64 libxtst6
+      - run: uv sync --frozen
+      - name: Install Camoufox
+        run: uv run camoufox fetch
+      - name: Test
+        run: uv run pytest -q
