@@ -11,22 +11,34 @@ compatibility: Needs the pi-camoufox server running (default http://127.0.0.1:87
 window, which is the point: when a captcha or login appears, ask the user to
 solve it instead of fighting it.
 
-Start it if it is not running:
+Start it if it is not running. It needs ~10 s to become ready, so start it in
+the background and poll instead of blocking or guessing:
 
 ```bash
-uv run pi-camoufox                 # headed, port 8787
-# or: make start
+cd /path/to/camoufox-agent-server
+(nohup uv run pi-camoufox > /tmp/pi-camoufox.log 2>&1 &)   # or foreground: make start
+for _ in $(seq 1 40); do curl -sf localhost:8787/health | grep -q '"ok":true' && break; sleep 1; done
 ```
 
-Check readiness first:
+If it refuses to start with `profile ... is already in use by pi-camoufox (pid N)`,
+an earlier server still holds the profile. Restart with `--replace` instead of
+hunting for the pid:
+
+```bash
+uv run pi-camoufox --replace
+```
+
+Check readiness with:
 
 ```bash
 curl -s http://127.0.0.1:8787/health
 ```
 
 `ok: true` and a non-empty `tabs` means you can act. The response also reports
-`browser.headless`, the profile, pending JavaScript dialogs and the event
-cursor.
+`browser.headless`, `browser.connected`, the profile, pending JavaScript
+dialogs and the event cursor. `/health` is also the recovery entry point: it
+probes the browser and relaunches a dead one, reporting `recovered: true` when
+it had to.
 
 ## The loop
 
@@ -72,7 +84,6 @@ that is not exposed as an interesting node.
 
 For search results, tables and feeds, `extract` is much faster and cheaper than
 a snapshot:
-
 ```bash
 curl -s -X POST localhost:8787/tabs/default/batch   -H 'content-type: application/json' -d '{
     "commands": [
@@ -92,10 +103,27 @@ A field is a selector string or an object with `selector` plus `attr`, `html`,
 `scope` to restrict the search. `required: true` turns an empty result into a
 `not_found` error.
 
+### SPA data: read the page's own state
+
+When a single-page app ships its data in a global (YouTube, many dashboards,
+any server-rendered-then-hydrated list), reading that global beats scraping the
+rendered DOM: one round trip, no refs, no lazy-loading surprises.
+
+```json
+{"action":"evaluate","expression":"Object.keys(window).filter(k => k.startsWith('ytInitial'))"}
+{"action":"evaluate","expression":"window.ytInitialData.contents.twoColumnSearchResultsRenderer.primaryContents.sectionListRenderer.contents[0].itemSectionRenderer.contents.slice(0,10).map(c => c.videoRenderer && ({id: c.videoRenderer.videoId, title: c.videoRenderer.title.runs[0].text}))"}
+{"action":"evaluate","expression":"window.ytInitialPlayerResponse?.videoDetails"}
+```
+
+`evaluate` runs in the page's main world by default, so page globals are
+visible. With `--isolated-eval` they are not — fall back to `extract` then.
+Return only the fields you need; a raw `window.ytInitialData` is megabytes.
+
 ### Overlays and blocked clicks
 
 Run `closeOverlays` before interacting with a page that may show a cookie or
-login modal:
+login modal. Run it *after* the first navigation — on a blank tab it is a
+no-op:
 
 ```json
 {"action":"closeOverlays"}
@@ -131,6 +159,78 @@ old ref. A `blocked` failure means an overlay is covering the target.
 
 Iframes are supported per action with `"frame": "#iframe-selector"` (a list for
 nested frames). Open shadow roots are included in snapshots and work with refs.
+
+## When the browser dies
+
+The user can close the window, and a crashed browser takes its context with it.
+Every failure carries a `code`; the one that matters here is:
+
+```json
+{"error":"BrowserContext.new_page: Target page, context or browser has been closed",
+ "code":"browser_closed","retryable":true,
+ "hint":"POST /browser/restart to relaunch the browser, then retry"}
+```
+
+Rules:
+
+1. Do **not** retry selectors, reload, or re-target refs — the page is gone.
+2. Recover with either `POST /health` (probes and relaunches, no-op if healthy)
+   or an explicit `POST /browser/restart`.
+3. Re-observe from scratch. Tabs, refs and in-page state are gone; the profile
+   (cookies, logins, fingerprint) survives, so you are still signed in.
+4. Inside a batch, a mid-flight browser death is reported as a per-command
+   `error.code: "browser_closed"`. With the default `stopOnError: false` the
+   remaining commands fail the same way; with `stopOnError: true` they are
+   skipped. Either way, treat every command after the first failure as not
+   applied: restart and resend the whole batch.
+5. A request that only needed a tab may recover on its own — the server
+   relaunches automatically. Expect tabs to be reset to `about:blank` and
+   re-navigate rather than assuming the old page is still live.
+
+A stale server that holds the profile lock while its browser is dead is the
+same failure one level up: restart it with `uv run pi-camoufox --replace`.
+
+## Reading responses
+
+`/act` returns one command's outcome; `/batch` returns the same shape per
+command:
+
+```json
+{"cursor":123,"results":[{"i":0,"action":"navigate","ok":true,"ms":412,
+  "result":{},"events":{"count":12,"byType":{},"highlights":[]}}],
+ "snapshot":{"url":"...","nodes":[]}}
+```
+
+So `.results[]` is the list, never the top level. Keep the transcript small:
+
+```bash
+curl -s -X POST localhost:8787/tabs/default/batch -H 'content-type: application/json' \
+  -d '{"commands":[...],"observe":"never","events":"none"}' \
+  | jq -c '{ok: ([.results[]?.ok] | all), r: [.results[]? | {i, action, ok, ms, error}]}'
+```
+
+`events` accepts `none`, `summary` (default) or `full`; `observe` accepts
+`auto`, `always`, `never`, `full`. Highlights are clipped to ~200 characters,
+because tracker URLs and stack traces are otherwise large enough to matter.
+Use `"events":"none"` for extract-and-continue loops, and `"observe":"never"`
+unless you need the new tree.
+
+If a call fails, the body is `{error, code, retryable?, hint?}` — never parse it
+as a batch result.
+
+## Speed
+
+For bulk reading (search pages, listings, tables) start the server with
+`--fast`: it enables the HTTP cache, lightens humanization and shortens the
+per-action settle window. Add `--block-images` only when you do not need
+screenshots.
+
+```bash
+(nohup uv run pi-camoufox --fast > /tmp/pi-camoufox.log 2>&1 &)
+```
+
+Prefer one batch over several `act` calls, `extract` over `snapshot`, and a
+`wait` with `forSelector`/`forText` over a fixed sleep.
 
 ## Captcha, login, 2FA: hand off to the user
 
@@ -268,6 +368,8 @@ After extracting the list, open the top 2–3 property pages and compare:
 
 - **Do not treat a captcha as a selector problem.** Retrying clicks or reloading
   usually makes the challenge worse. Hand off.
+- **Do not treat `browser_closed` as a selector problem either.** Restart the
+  browser; a dead context never recovers by itself.
 - **Refs go stale** when the DOM changes. The failure response includes a new
   snapshot; use it.
 - **Camoufox is Firefox.** Sites that require Chromium-only features may not
@@ -277,4 +379,9 @@ After extracting the list, open the top 2–3 property pages and compare:
 - **One browser, one profile.** `setFiles`/`dropFiles` and `evaluate` are
   powerful; keep the server bound to localhost.
 - **HTTP 200 with `ok: false`** is a command-level failure, not a transport
-  failure. Read `error.code` and `error.message`.
+  failure. Read `error.code`, then `error.message`.
+- **An error body is not a batch result.** `POST` failures return
+  `{error, code, retryable?, hint?}` at the top level; there is no `.results`.
+- **`--replace` beats pid archaeology.** A server that holds the profile while
+  its browser is dead blocks startup and looks alive to `/health` only if it is
+  from an older build — restart it with `--replace`.

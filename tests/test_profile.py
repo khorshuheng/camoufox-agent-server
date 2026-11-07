@@ -67,3 +67,32 @@ def test_release_does_not_remove_another_owners_lock(tmp_path) -> None:
 def test_is_process_alive() -> None:
     assert browser.is_process_alive(os.getpid()) is True
     assert browser.is_process_alive(999_999_999) is False
+
+
+def test_replace_stops_the_holder_and_frees_the_lock(tmp_path, monkeypatch) -> None:
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        profile = tmp_path / "profile"
+        profile.mkdir()
+        lock = browser.lock_file_for(profile)
+        lock.write_text(f"{holder.pid}\n", encoding="utf-8")
+        # The holder is a stand-in for a server with a different cmdline.
+        monkeypatch.setattr(browser, "_looks_like_our_server", lambda _pid: True)
+        assert browser.locked_by(profile) == holder.pid
+
+        stopped = browser.stop_profile_holder(profile, timeout_s=5)
+
+        assert stopped == holder.pid
+        assert not lock.exists()
+        assert browser.locked_by(profile) is None
+        acquired = browser.acquire_profile_lock(profile)
+        browser.release_profile_lock(acquired)
+    finally:
+        holder.kill()
+        holder.wait(timeout=5)
+
+
+def test_replace_is_a_noop_without_a_holder(tmp_path) -> None:
+    profile = tmp_path / "profile"
+    profile.mkdir()
+    assert browser.stop_profile_holder(profile) is None

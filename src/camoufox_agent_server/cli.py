@@ -11,11 +11,12 @@ from urllib.parse import unquote, urlparse
 
 import uvicorn
 
-from .browser import display_available, locked_by, resolve_profile
+from .browser import display_available, locked_by, resolve_profile, stop_profile_holder
 from .config import (
     DEFAULT_DIALOG_TIMEOUT_MS,
     DEFAULT_HTTP_PORT,
     DEFAULT_SETTLE_MS,
+    FAST_SETTLE_MS,
     BrowserOptions,
     ServerOptions,
     host_os,
@@ -71,6 +72,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="disable COOP so cross-origin iframe widgets (e.g. Turnstile) can be clicked",
     )
     parser.add_argument("--enable-cache", action="store_true")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "latency preset for bulk reading: enable the HTTP cache, light humanization "
+            "and shorter settling (combine with --block-images when screenshots are not needed)"
+        ),
+    )
+    parser.add_argument(
+        "--replace",
+        action="store_true",
+        help="stop a pi-camoufox server that still holds this profile, then start",
+    )
     parser.add_argument(
         "--isolated-eval",
         action="store_true",
@@ -149,7 +163,7 @@ def options_from_args(args: argparse.Namespace) -> ServerOptions:
         profile=resolve_profile(args.profile),
         headless=headless,
         os=target_os,
-        humanize=not args.no_humanize,
+        humanize=0.4 if args.fast and not args.no_humanize else not args.no_humanize,
         geoip=bool(args.geoip),
         proxy=parse_proxy(args.proxy),
         locale=locale,
@@ -157,17 +171,20 @@ def options_from_args(args: argparse.Namespace) -> ServerOptions:
         block_webrtc=args.block_webrtc,
         block_webgl=args.block_webgl,
         disable_coop=args.disable_coop,
-        enable_cache=args.enable_cache,
+        enable_cache=args.enable_cache or args.fast,
         main_world_eval=not args.isolated_eval,
         executable=args.executable,
         rotate_fingerprint=args.rotate_fingerprint,
         extra_args=list(args.arg),
     )
+    settle_ms = args.settle_ms
+    if args.fast and settle_ms == DEFAULT_SETTLE_MS:
+        settle_ms = FAST_SETTLE_MS
     return ServerOptions(
         browser=browser,
         host=args.host,
         http_port=args.http_port,
-        settle_ms=args.settle_ms,
+        settle_ms=settle_ms,
         dialog_timeout_ms=args.dialog_timeout,
         debug=args.debug,
         fail_fast=True,
@@ -199,11 +216,16 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 1
     holder = locked_by(options.browser.profile)
+    if holder is not None and args.replace:
+        print(f"stopping pi-camoufox (pid {holder}) that holds this profile", file=sys.stderr)
+        stop_profile_holder(options.browser.profile)
+        holder = locked_by(options.browser.profile)
     if holder is not None:
         print(
             f"profile {options.browser.profile} is already in use by pi-camoufox "
             f"(pid {holder}).\n"
             "  * stop that server first, or\n"
+            "  * restart it with --replace, or\n"
             "  * use a different profile with --profile.",
             file=sys.stderr,
         )

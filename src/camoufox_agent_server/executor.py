@@ -11,6 +11,7 @@ import time
 from typing import Any
 
 from .actions import ACTIONS, READ_ONLY, ActionError
+from .errors import closed_error_hint, is_closed_error
 from .events import Event, frame, summarize
 from .session import Tab
 
@@ -30,6 +31,7 @@ CHANGE_ACTIONS = {
     "clickAt",
 }
 OBSERVE_MODES = {"auto", "always", "never", "full"}
+EVENT_MODES = {"none", "summary", "full"}
 
 
 class Executor:
@@ -43,12 +45,15 @@ class Executor:
         commands: list[dict[str, Any]],
         *,
         observe: str = "auto",
+        events_mode: str = "summary",
         settle_ms: int | None = None,
         stop_on_error: bool = False,
         timeout_ms: int = 30_000,
     ) -> dict[str, Any]:
         if observe not in OBSERVE_MODES:
             observe = "auto"
+        if events_mode not in EVENT_MODES:
+            events_mode = "summary"
         results: list[dict[str, Any]] = []
         cursor = tab.events.mark()
 
@@ -103,7 +108,13 @@ class Executor:
             except ActionError as exc:
                 error = exc
             except Exception as exc:  # noqa: BLE001 - surface any browser failure to the agent
-                error = ActionError(str(exc) or exc.__class__.__name__, code="action_failed")
+                message = str(exc) or exc.__class__.__name__
+                if is_closed_error(exc):
+                    # The browser died mid-batch. Name it, so the agent restarts
+                    # instead of re-targeting refs against a dead page.
+                    error = ActionError(message, code="browser_closed", details=closed_error_hint())
+                else:
+                    error = ActionError(message, code="action_failed")
 
             if settle_ms is None:
                 budget = self.default_settle_ms
@@ -136,7 +147,7 @@ class Executor:
                         pass
             elif result is not None:
                 entry["result"] = compact_result(result)
-            compacted = compact_events(events, observe)
+            compacted = compact_events(events, observe, events_mode)
             if compacted:
                 entry["events"] = compacted
             results.append(entry)
@@ -217,14 +228,16 @@ def _error_payload(error: ActionError) -> dict[str, Any]:
     return payload
 
 
-def compact_events(events: list[Event], observe: str) -> dict[str, Any] | None:
-    if not events:
+def compact_events(
+    events: list[Event], observe: str, events_mode: str = "summary"
+) -> dict[str, Any] | None:
+    if not events or events_mode == "none":
         return None
     digest = summarize(events)
     payload: dict[str, Any] = {"count": len(events), "byType": digest["byType"]}
     if digest["highlights"]:
         payload["highlights"] = digest["highlights"]
-    if observe == "full":
+    if observe == "full" or events_mode == "full":
         payload["all"] = [frame(event) for event in events]
     return payload
 

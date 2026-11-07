@@ -530,3 +530,67 @@ async def test_actions_inside_an_iframe(client: httpx.AsyncClient, web_server: s
     assert clicked["ok"] is True, clicked
     text = await act(client, action="getText", frame="#inner", selector="#inner-result")
     assert text["result"]["text"] == "clicked"
+
+
+async def test_unknown_tab_errors_carry_a_code(client: httpx.AsyncClient) -> None:
+    response = await client.get("/tabs/nope/snapshot")
+    assert response.status_code == 404
+    assert response.json()["code"] == "unknown_tab"
+
+
+async def test_batch_can_omit_events(client: httpx.AsyncClient, web_server: str) -> None:
+    out = await batch(
+        client,
+        [{"action": "navigate", "url": web(web_server, "index.html")}],
+        observe="never",
+        events="none",
+    )
+    assert out["results"][0]["ok"] is True
+    assert "events" not in out["results"][0]
+
+
+async def test_events_mode_full_includes_every_frame(
+    client: httpx.AsyncClient, web_server: str
+) -> None:
+    out = await batch(
+        client,
+        [{"action": "navigate", "url": web(web_server, "index.html")}],
+        observe="never",
+        events="full",
+    )
+    entry = out["results"][0]
+    assert entry["events"]["count"] >= 1
+    assert entry["events"]["all"]
+
+
+async def test_health_reports_a_connected_browser(client: httpx.AsyncClient) -> None:
+    health = (await client.get("/health")).json()
+    assert health["ok"] is True
+    assert health["browser"]["connected"] is True
+
+
+async def test_health_revives_a_closed_window(
+    client: httpx.AsyncClient, app: Any, web_server: str
+) -> None:
+    manager = app.state.manager
+    assert manager.handle is not None
+    # Simulate the user closing the browser window: the context dies but the
+    # server keeps running, which is exactly what used to wedge every request.
+    await manager.handle.context.close()
+
+    health = (await client.get("/health")).json()
+    assert health["ok"] is True
+    assert health["browser"]["connected"] is True
+    assert health.get("recovered") is True
+
+    moved = await act(client, action="navigate", url=web(web_server, "index.html"))
+    assert moved["ok"] is True, moved
+
+
+async def test_restart_route_rebuilds_the_browser(client: httpx.AsyncClient) -> None:
+    response = await client.post("/browser/restart")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["restarted"] is True
+    assert body["tabs"][0]["url"] == "about:blank"
+    assert (await client.get("/health")).json()["ok"] is True

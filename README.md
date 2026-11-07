@@ -158,8 +158,9 @@ dialogs are auto-dismissed after `--dialog-timeout` (default 30 s, `0` = never).
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/` | Route index |
-| `GET` | `/health` | Browser version, profile, tabs, pending dialogs, cursor (`?challenges=1` also checks each tab) |
+| `GET` | `/health` | Browser version, connection state, profile, tabs, pending dialogs, cursor (`?challenges=1` also checks each tab); relaunches a dead browser and reports `recovered` |
 | `GET` | `/actions` | Action vocabulary |
+| `POST` | `/browser/restart` | Relaunch the browser on the same profile (recovery from `browser_closed`) |
 | `GET` | `/tabs` | List tabs (most-recently-used marked `active`) |
 | `POST` | `/tabs` | Open a tab `{"url": "..."}` |
 | `DELETE` | `/tabs/:id` | Close a tab |
@@ -214,7 +215,15 @@ included in snapshots and in ref-based actions.
 ```
 
 A command-level failure is still HTTP 200; it is data, not a transport error.
-Malformed requests, unknown tabs and invalid bodies use 4xx.
+Malformed requests, unknown tabs and invalid bodies use 4xx. Two knobs keep the
+payload small: `events` (`none` | `summary` | `full`, default `summary`) and
+`observe` (`auto` | `always` | `never` | `full`). Event highlights are clipped
+to ~200 characters so one tracker URL cannot dominate the response.
+
+A closed browser is the one failure worth special-casing: it returns HTTP 503
+with `code: "browser_closed"`, `retryable: true`, and a hint pointing at
+`POST /browser/restart`. Inside a batch it appears as a per-command
+`error.code`, and `/health` heals it automatically.
 
 ## Actions
 
@@ -397,6 +406,8 @@ pi-camoufox [options]
   --block-images / --block-webrtc / --block-webgl
   --disable-coop        Allow clicking cross-origin iframe widgets (e.g. Turnstile)
   --enable-cache
+  --fast                Latency preset for bulk reading: cache + light humanize + short settle
+  --replace             Stop a server that still holds this profile, then start
   --isolated-eval       Run page JS in Camoufox's isolated world
   --executable <path>   Custom Camoufox binary
   --rotate-fingerprint  Draw and store a new identity

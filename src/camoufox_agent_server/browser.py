@@ -7,6 +7,7 @@ import logging
 import os
 import platform
 import tempfile
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,11 +35,17 @@ class BrowserHandle:
     context: Any
     fingerprint_meta: dict[str, Any]
     lock_file: Path | None = None
+    #: The browser behind this handle is gone (died, or was closed by us).
     closed: bool = False
+    #: ``close()`` already ran. Separate from ``closed`` because a browser can
+    #: die on its own (window closed, crash) and still need a teardown pass to
+    #: release the profile lock.
+    torn_down: bool = False
 
     async def close(self) -> None:
-        if self.closed:
+        if self.torn_down:
             return
+        self.torn_down = True
         self.closed = True
         try:
             await self.camoufox.__aexit__(None, None, None)
@@ -152,6 +159,40 @@ def release_profile_lock(lock: Path) -> None:
             lock.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def stop_profile_holder(profile: Path, *, timeout_s: float = 10.0) -> int | None:
+    """Terminate the server holding this profile (``--replace``).
+
+    Returns the pid that was asked to stop, or None when nobody held it. The
+    lock file is removed afterwards even if the process could not clean it up
+    itself, so the caller can acquire it immediately.
+    """
+    import signal
+
+    holder = locked_by(profile)
+    if holder is None or holder == os.getpid():
+        return None
+    for stop_signal in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.kill(holder, stop_signal)
+        except OSError:
+            break
+        deadline = time.monotonic() + timeout_s / 2
+        while time.monotonic() < deadline:
+            if not is_process_alive(holder):
+                break
+            time.sleep(0.1)
+        if not is_process_alive(holder):
+            break
+    # The holder may have died without running its cleanup.
+    lock = lock_file_for(profile)
+    try:
+        if lock.read_text(encoding="utf-8").strip() == str(holder):
+            lock.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return holder
 
 
 def load_or_create_fingerprint(

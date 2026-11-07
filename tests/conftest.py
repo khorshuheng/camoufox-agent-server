@@ -6,6 +6,7 @@ import os
 import threading
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -31,7 +32,7 @@ def web_server() -> str:
 
 
 @pytest.fixture(scope="session")
-async def server_url(tmp_path_factory: pytest.TempPathFactory) -> str:
+def app(tmp_path_factory: pytest.TempPathFactory) -> Any:
     profile = tmp_path_factory.mktemp("camoufox") / "profile"
     headed = os.environ.get("SMOKE_HEADED") == "1"
     options = ServerOptions(
@@ -39,7 +40,11 @@ async def server_url(tmp_path_factory: pytest.TempPathFactory) -> str:
         settle_ms=60,
         dialog_timeout_ms=2_000,
     )
-    app = create_app(options)
+    return create_app(options)
+
+
+@pytest.fixture(scope="session")
+async def server_url(app: Any) -> str:
     config = uvicorn.Config(
         app,
         host="127.0.0.1",

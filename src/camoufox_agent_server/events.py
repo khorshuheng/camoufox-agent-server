@@ -15,6 +15,11 @@ from typing import Any
 
 Event = dict[str, Any]
 
+# A single highlight is a hint, not a payload: long tracker URLs and stack
+# traces are truncated so one noisy request cannot dominate an agent's context.
+HIGHLIGHT_CHARS = 200
+MAX_HIGHLIGHTS = 40
+
 
 class EventBus:
     def __init__(self, capacity: int = 4000, coalesce_window_ms: int = 400) -> None:
@@ -137,22 +142,36 @@ def summarize(events: list[Event]) -> dict[str, Any]:
         by_type[event["type"]] = by_type.get(event["type"], 0) + 1
         data = event["data"]
         if event["type"] == "console" and data.get("level") in ("error", "warning"):
-            highlights.append(f"[{data['level']}] {data.get('text', '')}")
+            highlights.append(_clip(f"[{data['level']}] {data.get('text', '')}"))
         elif event["type"] == "pageerror":
-            highlights.append(f"[pageerror] {data.get('message', '')}")
+            highlights.append(_clip(f"[pageerror] {data.get('message', '')}"))
         elif event["type"] == "requestfailed":
             highlights.append(
-                f"[netfail] {data.get('method', '')} "
-                f"{data.get('url', '')} {data.get('failure', '')}"
+                _clip(
+                    f"[netfail] {data.get('method', '')} "
+                    f"{data.get('url', '')} {data.get('failure', '')}"
+                )
             )
         elif event["type"] == "response" and int(data.get("status") or 0) >= 400:
             highlights.append(
-                f"[http {data['status']}] {data.get('method', '')} {data.get('url', '')}"
+                _clip(f"[http {data['status']}] {data.get('method', '')} {data.get('url', '')}")
             )
         elif event["type"] == "navigation":
-            highlights.append(f"[nav] {data.get('url', '')}")
+            highlights.append(_clip(f"[nav] {data.get('url', '')}"))
         elif event["type"] == "dialog":
-            highlights.append(f"[dialog {data.get('kind', '')}] {data.get('message', '')}")
+            highlights.append(_clip(f"[dialog {data.get('kind', '')}] {data.get('message', '')}"))
         elif event["type"] == "download":
-            highlights.append(f"[download] {data.get('filename') or data.get('url', '')}")
-    return {"byType": by_type, "highlights": highlights[:40], "total": len(events)}
+            highlights.append(_clip(f"[download] {data.get('filename') or data.get('url', '')}"))
+    return {"byType": by_type, "highlights": highlights[:MAX_HIGHLIGHTS], "total": len(events)}
+
+
+def _clip(text: str, limit: int = HIGHLIGHT_CHARS) -> str:
+    """Collapse and shorten a highlight.
+
+    Tracker and analytics URLs routinely run to several KB of query string;
+    pasted verbatim into an agent's context they cost more than the page did.
+    """
+    collapsed = " ".join(str(text).split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return f"{collapsed[: limit - 1]}\u2026"

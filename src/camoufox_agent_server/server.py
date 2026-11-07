@@ -4,6 +4,7 @@ The interface is deliberately small and agent-shaped:
 
     GET  /health                    browser state, tabs, pending dialogs
     GET  /actions                   action vocabulary
+    POST /browser/restart           relaunch a closed browser on the same profile
     GET  /tabs                      list tabs
     POST /tabs                      open a tab                 {url}
     DELETE /tabs/{id}               close a tab
@@ -39,7 +40,9 @@ from pydantic import BaseModel, ConfigDict, Field
 from sse_starlette.sse import EventSourceResponse
 
 from .actions import ActionError, list_actions
+from .browser import BrowserLaunchError
 from .config import ServerOptions
+from .errors import BROWSER_CLOSED_HINT, BrowserUnavailable, is_closed_error
 from .events import Event, EventBus, frame
 from .executor import Executor
 from .manager import Manager, UnknownTab
@@ -63,6 +66,7 @@ class BatchRequest(BaseModel):
 
     commands: list[dict[str, Any]]
     observe: str = "auto"
+    events: str = "summary"
     settle_ms: int | None = Field(default=None, alias="settleMs")
     stop_on_error: bool = Field(default=False, alias="stopOnError")
     timeout_ms: int = Field(default=30_000, alias="timeoutMs")
@@ -154,7 +158,22 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
 
     @app.exception_handler(UnknownTab)
     async def _unknown_tab(_request: Request, exc: UnknownTab) -> JSONResponse:
-        return JSONResponse({"error": f"unknown tab {exc.args[0]!r}"}, status_code=404)
+        return JSONResponse(
+            {"error": f"unknown tab {exc.args[0]!r}", "code": "unknown_tab"},
+            status_code=404,
+        )
+
+    @app.exception_handler(BrowserUnavailable)
+    async def _browser_unavailable(_request: Request, exc: BrowserUnavailable) -> JSONResponse:
+        return JSONResponse(
+            {
+                "error": str(exc),
+                "code": "browser_closed",
+                "retryable": True,
+                "hint": BROWSER_CLOSED_HINT,
+            },
+            status_code=503,
+        )
 
     @app.exception_handler(ActionError)
     async def _action_error(_request: Request, exc: ActionError) -> JSONResponse:
@@ -172,13 +191,23 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
 
     @app.exception_handler(Exception)
     async def _unhandled(_request: Request, exc: Exception) -> JSONResponse:
-        log.exception("unhandled request failure")
-        payload: dict[str, Any] = {"error": str(exc) or exc.__class__.__name__}
+        closed = is_closed_error(exc)
+        if closed:
+            log.warning("browser went away during a request: %s", exc)
+        else:
+            log.exception("unhandled request failure")
+        payload: dict[str, Any] = {
+            "error": str(exc) or exc.__class__.__name__,
+            "code": "browser_closed" if closed else "internal",
+        }
+        if closed:
+            payload["retryable"] = True
+            payload["hint"] = BROWSER_CLOSED_HINT
         if options.debug:
             import traceback
 
             payload["stack"] = traceback.format_exc()
-        return JSONResponse(payload, status_code=500)
+        return JSONResponse(payload, status_code=503 if closed else 500)
 
     # -- discovery ---------------------------------------------------------
 
@@ -190,6 +219,7 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
             "routes": [
                 "GET /health",
                 "GET /actions",
+                "POST /browser/restart",
                 "GET /tabs",
                 "POST /tabs",
                 "DELETE /tabs/{id}",
@@ -233,7 +263,26 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
                     '[{"action":"navigate","url":"https://example.com"},'
                     '{"action":"click","ref":"e5"}],"observe":"auto"}'
                 ),
+                "recovery": "POST /browser/restart",
             },
+        }
+
+    @app.post("/browser/restart")
+    async def restart_browser() -> dict[str, Any]:
+        """Relaunch the browser on the same profile, dropping every tab.
+
+        This is the recovery path for ``code: "browser_closed"``: the profile
+        persists, so logins survive, but in-page state does not.
+        """
+        try:
+            handle = await manager.restart("restart requested over HTTP")
+        except BrowserLaunchError as error:
+            raise BrowserUnavailable(str(error)) from error
+        return {
+            "restarted": True,
+            "version": manager.version,
+            "fingerprint": handle.fingerprint_meta,
+            "tabs": await manager.list_tabs(),
         }
 
     # -- tabs --------------------------------------------------------------
@@ -280,12 +329,13 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
 
     @app.post("/tabs/{tab_id}/act")
     async def act(tab_id: str, body: dict[str, Any] = Body(...)) -> dict[str, Any]:
-        tab = await manager.ensure_tab(tab_id)
+        tab = await _resolve_tab(manager, tab_id)
         async with tab.lock:
             out = await executor.run(
                 tab,
                 [body],
                 observe=str(body.get("observe") or "auto"),
+                events_mode=str(body.get("events") or "summary"),
                 settle_ms=_optional_int(body.get("settleMs")),
                 stop_on_error=True,
             )
@@ -302,12 +352,13 @@ def create_app(options: ServerOptions | None = None) -> FastAPI:
                 f"too many commands ({len(body.commands)}); max {MAX_BATCH} per batch",
                 code="bad_request",
             )
-        tab = await manager.ensure_tab(tab_id)
+        tab = await _resolve_tab(manager, tab_id)
         async with tab.lock:
             out = await executor.run(
                 tab,
                 body.commands,
                 observe=body.observe,
+                events_mode=body.events,
                 settle_ms=body.settle_ms,
                 stop_on_error=body.stop_on_error,
                 timeout_ms=body.timeout_ms,
@@ -459,6 +510,27 @@ def _sse(event: Event, *, coalesced: bool = False) -> dict[str, str]:
         "id": str(event["seq"]),
         "data": json.dumps(frame(event, coalesced=coalesced), separators=(",", ":")),
     }
+
+
+async def _resolve_tab(manager: Manager, tab_id: str) -> Any:
+    """Resolve a tab, recovering once when the browser has gone away.
+
+    Resolving the tab happens before any command runs, so relaunching here
+    cannot replay a half-applied batch: there is nothing to replay yet.
+    """
+    try:
+        return await manager.ensure_tab(tab_id)
+    except UnknownTab:
+        raise
+    except Exception as error:  # noqa: BLE001 - recover from a closed browser
+        if not is_closed_error(error):
+            raise
+        log.warning("tab resolution hit a closed browser; relaunching")
+        try:
+            await manager.restart("the browser context was gone")
+        except BrowserLaunchError as launch_error:
+            raise BrowserUnavailable(str(launch_error)) from launch_error
+        return await manager.ensure_tab(tab_id)
 
 
 async def _gc_loop(artifacts: ArtifactStore) -> None:
